@@ -29,12 +29,15 @@ def fused_grouped_fwd_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    USE_SCALES: tl.constexpr,
 ):
     """Fused grouped GEMM: C[g_start:g_end, :] = A[g_start:g_end, :] @ W[g].T
 
        Each program processes one (group, M-tile, N-tile) triple.
        GROUP_M swizzling is applied across all groups' M tiles combined.
        N-slicing: BLOCK_N is split into HALF_N left/right halves.
+       USE_SCALES: if False, skips all scale loads (fast path, ~1820 TFLOPS).
+                   if True, loads E8M0 per-32-element scales (MXFP8, ~1500 TFLOPS).
     """
     HALF_N: tl.constexpr = BLOCK_N // 2
 
@@ -78,19 +81,11 @@ def fused_grouped_fwd_kernel(
               + offs_m[:, None] * stride_am
               + offs_k[None, :] * stride_ak)
 
-    # A scale pointers [BLOCK_M, BLOCK_K // 32]
-    # Scales: 1 E8M0 per 32 K elements, same M layout
+    # KS is always defined (used for constexpr elsewhere)
     KS: tl.constexpr = BLOCK_K // 32
-    offs_ks = tl.arange(0, KS)
-    a_scale_ptrs = (a_scale_ptr + row_start * stride_asm
-                    + offs_m[:, None] * stride_asm
-                    + offs_ks[None, :])
 
     # W base for this group: W[gid, :, :]
     w_base = w_ptr + gid * stride_we
-
-    # W scale base for this group: W_scales[gid, :, :]
-    ws_base = w_scale_ptr + gid * stride_wse
 
     # W pointers [BLOCK_K, HALF_N]  —  K-major layout for dot input
     w_ptrs_l = (w_base
@@ -110,13 +105,22 @@ def fused_grouped_fwd_kernel(
     acc_l = tl.zeros((BLOCK_M, HALF_N), dtype=tl.float32)
     acc_r = tl.zeros((BLOCK_M, HALF_N), dtype=tl.float32)
 
-    # W scale pointers [BLOCK_K//32, HALF_N] — K//32 is innermost (stride 1)
-    ws_ptrs_l = (ws_base
-                 + offs_ks[:, None] * 1
-                 + offs_nl[None, :] * stride_wsn)
-    ws_ptrs_r = (ws_base
-                 + offs_ks[:, None] * 1
-                 + offs_nr[None, :] * stride_wsn)
+    # --- Scale pointers (compile-time eliminated when USE_SCALES=False) ---
+    if USE_SCALES:
+        offs_ks = tl.arange(0, KS)
+        # A scale pointers [BLOCK_M, KS] — row stride = K//32
+        a_scale_ptrs = (a_scale_ptr + (row_start + offs_m[:, None]) * stride_asm
+                        + offs_ks[None, :])
+        a_scale_mask = (row_start + offs_m[:, None]) < g_end
+        # W scale base for this group
+        ws_base = w_scale_ptr + gid * stride_wse
+        # W scale pointers [HALF_N, KS]
+        ws_ptrs_l = (ws_base
+                     + offs_nl[:, None] * stride_wsn
+                     + offs_ks[None, :] * 1)
+        ws_ptrs_r = (ws_base
+                     + offs_nr[:, None] * stride_wsn
+                     + offs_ks[None, :] * 1)
 
     # --- Main K loop ---
     num_k_blocks = tl.cdiv(K, BLOCK_K)
@@ -125,25 +129,28 @@ def fused_grouped_fwd_kernel(
         b_l = tl.load(w_ptrs_l, mask=k_mask & n_mask_l, other=0.0)
         b_r = tl.load(w_ptrs_r, mask=k_mask & n_mask_r, other=0.0)
 
-        # Load scale tiles (E8M0, 1 byte per scale)
-        a_sc = tl.load(a_scale_ptrs, mask=a_mask[:, :KS], other=0.0)
-        ws_l = tl.load(ws_ptrs_l, mask=(offs_ks[:, None] < KS) & n_mask_l, other=0.0)
-        ws_r = tl.load(ws_ptrs_r, mask=(offs_ks[:, None] < KS) & n_mask_r, other=0.0)
-
         a8 = a_blk.to(tl.float8e4nv)
         b8_l = b_l.to(tl.float8e4nv)
         b8_r = b_r.to(tl.float8e4nv)
 
-        acc_l = tl.dot_scaled(a8, a_sc, "e4m3", b8_l, ws_l, "e4m3", acc=acc_l)
-        acc_r = tl.dot_scaled(a8, a_sc, "e4m3", b8_r, ws_r, "e4m3", acc=acc_r)
+        if USE_SCALES:
+            a_sc = tl.load(a_scale_ptrs, mask=a_scale_mask, other=0.0)
+            ws_l = tl.load(ws_ptrs_l, mask=offs_nl[:, None] < N, other=0.0)
+            ws_r = tl.load(ws_ptrs_r, mask=offs_nr[:, None] < N, other=0.0)
+            acc_l = tl.dot_scaled(a8, a_sc, "e4m3", b8_l, ws_l, "e4m3", acc=acc_l)
+            acc_r = tl.dot_scaled(a8, a_sc, "e4m3", b8_r, ws_r, "e4m3", acc=acc_r)
+        else:
+            acc_l = tl.dot_scaled(a8, None, "e4m3", b8_l, None, "e4m3", acc=acc_l)
+            acc_r = tl.dot_scaled(a8, None, "e4m3", b8_r, None, "e4m3", acc=acc_r)
 
         # Advance in K
         a_ptrs += BLOCK_K * stride_ak
-        a_scale_ptrs += KS  # 1 element per 32 K elements, row-major stride=1
         w_ptrs_l += BLOCK_K * stride_wk
         w_ptrs_r += BLOCK_K * stride_wk
-        ws_ptrs_l += KS * 1  # advance K/32 in scale K dimension (stride 1)
-        ws_ptrs_r += KS * 1
+        if USE_SCALES:
+            a_scale_ptrs += KS
+            ws_ptrs_l += KS * 1
+            ws_ptrs_r += KS * 1
 
     # --- Store to C ---
     offs_cm = row_start + tl.arange(0, BLOCK_M)
@@ -165,7 +172,7 @@ def fused_grouped_fwd_kernel(
 def fused_grouped_fwd(a_fp8, w_fp8, offs,
                       a_scales=None, w_scales=None,
                       BLOCK_M=128, BLOCK_N=128, BLOCK_K=128,
-                      GROUP_SIZE_M=8):
+                      GROUP_SIZE_M=8, num_stages=None, num_warps=None):
     """Run fused grouped GEMM.
 
        Args:
@@ -181,10 +188,12 @@ def fused_grouped_fwd(a_fp8, w_fp8, offs,
     E, N, K2 = w_fp8.shape
     assert K == K2, f"K mismatch: {K} vs {K2}"
 
-    if a_scales is None:
-        a_scales = torch.full((M, K // 32), 0x38, dtype=torch.uint8, device=a_fp8.device)
-    if w_scales is None:
-        w_scales = torch.full((E, N, K // 32), 0x38, dtype=torch.uint8, device=a_fp8.device)
+    use_scales = a_scales is not None and w_scales is not None
+
+    if not use_scales:
+        # Dummy tensors — never loaded, but Triton needs valid pointers
+        a_scales = torch.empty(1, dtype=torch.uint8, device=a_fp8.device)
+        w_scales = torch.empty(1, dtype=torch.uint8, device=a_fp8.device)
 
     c = torch.empty(M, N, dtype=torch.bfloat16, device=a_fp8.device)
 
@@ -195,17 +204,27 @@ def fused_grouped_fwd(a_fp8, w_fp8, offs,
     num_pid_n = triton.cdiv(N, BLOCK_N)
     grid = (num_pid_m_total * num_pid_n,)
 
+    kernel_args = dict(
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        USE_SCALES=use_scales,
+    )
+    if num_stages is not None:
+        kernel_args['num_stages'] = num_stages
+    if num_warps is not None:
+        kernel_args['num_warps'] = num_warps
+
     fused_grouped_fwd_kernel[grid](
         a_fp8, w_fp8, c, offs,
         a_scales, w_scales,
         M, N, K, E,
         a_fp8.stride(0), a_fp8.stride(1),
-        a_scales.stride(0),
+        a_scales.stride(0) if use_scales else 0,
         w_fp8.stride(0), w_fp8.stride(1), w_fp8.stride(2),
-        w_scales.stride(0), w_scales.stride(1),
+        w_scales.stride(0) if use_scales else 0,
+        w_scales.stride(1) if use_scales else 0,
         c.stride(0), c.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        GROUP_SIZE_M=GROUP_SIZE_M,
+        **kernel_args,
     )
     return c
 
