@@ -1,0 +1,47 @@
+# Workspace clutter
+.openclaw/
+HEARTBEAT.md
+SOUL.md
+AGENTS.md
+IDENTITY.md
+USER.md
+TOOLS.md
+
+# Intermediate test files
+*_test.py
+test_*.py
+micro_test.py
+tiny_test.py
+mini_nslice.py
+bisect.py
+b_test.py
+ns_test.py
+stepwise.py
+bench_ur.py
+
+# Old/experimental kernels
+fwd_128*.py
+fwd_bench.py
+fwd_bigsweep.py
+fwd_bigtiles.py
+fwd_db_test.py
+fwd_dbuf.py
+fwd_gluon_opt.py
+fwd_minimal.py
+fwd_nslice_32.py
+fwd_nslice_fixed.py
+fwd_simple.py
+fwd_sweep.py
+fwd_unroll.py
+gluon_fwd_fixed.py
+
+# Patches/misc
+fix_patch_v2.py
+fix_v2_indent.py
+gg_patch.pth
+kernel_mapping_final.md
+kernel_profile_bf16_vs_mxfp8.md
+bench_wgrad.py
+
+# Website
+Indianspeedster.github.io/
